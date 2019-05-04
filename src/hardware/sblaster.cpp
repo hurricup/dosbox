@@ -782,6 +782,8 @@ static void DSP_Reset(void) {
 	sb.dsp.cmd_len=0;
 	sb.dsp.in.pos=0;
 	sb.dsp.write_busy=0;
+	SB_MIDIIN_OFF(false);
+	MIDI_ClearBuffer(MOUT_SBUART);
 	PIC_RemoveEvents(DSP_FinishReset);
 
 	sb.dma.left=0;
@@ -1198,12 +1200,14 @@ static void DSP_DoWrite(Bit8u val) {
 
 static Bit8u DSP_ReadData(void) {
 /* Static so it repeats the last value on succesive reads (JANGLE DEMO) */
+	SDL_mutexP(SBLock);
 	if (sb.dsp.out.used) {
 		sb.dsp.out.lastval=sb.dsp.out.data[sb.dsp.out.pos];
 		sb.dsp.out.pos++;
 		if (sb.dsp.out.pos>=DSP_BUFSIZE) sb.dsp.out.pos-=DSP_BUFSIZE;
 		sb.dsp.out.used--;
 	}
+	SDL_mutexV(SBLock);
 	return sb.dsp.out.lastval;
 }
 
@@ -1503,8 +1507,9 @@ static Bit8u CTMIXER_Read(void) {
 		}
 		return ret;
 	case 0x82:		/* IRQ Status */
-		return	(sb.irq.pending_8bit ? 0x1 : 0) |
-				(sb.irq.pending_16bit ? 0x2 : 0) | 
+		return	(sb.irq.pending_8bit   ? 0x1 : 0) |
+				(sb.irq.pending_16bit  ? 0x2 : 0) |
+				(sb.irq.pending_mpuirq ? 0x4 : 0) |
 				((sb.type == SBT_16) ? 0x20 : 0);
 	default:
 		if (	((sb.type == SBT_PRO1 || sb.type == SBT_PRO2) && sb.mixer.index==0x0c) || /* Input control on SBPro */
@@ -1569,7 +1574,8 @@ static void write_sb(Bitu port,Bitu val,Bitu /*iolen*/) {
 		DSP_DoReset(val8);
 		break;
 	case DSP_WRITE_DATA:
-		DSP_DoWrite(val8);
+		if (sb.dsp.midiout_raw) MIDI_RawOutByte(val,MOUT_SBUART);
+		else DSP_DoWrite(val);
 		break;
 	case MIXER_INDEX:
 		sb.mixer.index=val8;
@@ -1808,6 +1814,8 @@ public:
 		/* Soundblaster midi interface */
 		if (!MIDI_Available()) sb.midi = false;
 		else sb.midi = true;
+
+		SBLock = SDL_CreateMutex();
 	}	
 	
 	~SBLASTER() {
@@ -1827,7 +1835,9 @@ public:
 			break;
 		}
 		if (sb.type==SBT_NONE || sb.type==SBT_GB) return;
-		DSP_Reset(); // Stop everything	
+		DSP_Reset(); //Stop everything
+		SDL_DestroyMutex(SBLock);
+		SBLock=0;
 	}	
 }; //End of SBLASTER class
 
