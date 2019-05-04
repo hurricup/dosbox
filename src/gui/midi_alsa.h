@@ -113,6 +113,7 @@ int input_handler(void * val) {
 				break;
 		}
 	}
+    return 0;
 }
 
 class MidiHandler_alsa : public MidiHandler {

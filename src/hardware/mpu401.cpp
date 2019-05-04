@@ -150,17 +150,6 @@ static struct {
 		Bits ticks_in;
 		float freq_mod;
 		bool active;
-		Bit8u cth_rate[4],cth_mode;
-		Bit8u midimetro,metromeas;
-		Bitu metronome_state;
-		Bitu cth_counter,cth_old;
-		Bitu rec_counter;
-		Bit32s measure_counter,meas_old;
-		Bitu metronome_counter;
-		Bit32s freq;
-		Bits ticks_in;
-		float freq_mod;
-		bool active;
 	} clock;
 	struct {
 		bool all_thru,midi_thru,sysex_thru,commonmsgs_thru;
@@ -222,9 +211,6 @@ static INLINE void MPU401_RunClock(void) {
 
 static INLINE void MPU401_QueueByte(Bit8u data) {
 	if (mpu.state.block_ack) {mpu.state.block_ack=false;return;}
-		mpu.state.irq_pending=true;
-		PIC_ActivateIRQ(mpuhw.irq);
-	}
 	if (mpu.queue_used<MPU401_QUEUE) {
 		Bitu pos=mpu.queue_used+mpu.queue_pos;
 		if (pos>=MPU401_QUEUE) pos-=MPU401_QUEUE;
@@ -297,6 +283,7 @@ void MPU401_SetTx(bool status) {
 
 static void MPU401_WriteCommand(Bitu port,Bitu val,Bitu iolen) {
 	if (mpu.mode==M_UART && val!=0xff) return;
+#if 0
 	if (mpu.state.reset) {
 		if (mpu.state.cmd_pending || val!=0xff) {
 			mpu.state.cmd_pending=val+1;
@@ -305,6 +292,7 @@ static void MPU401_WriteCommand(Bitu port,Bitu val,Bitu iolen) {
 		PIC_RemoveEvents(MPU401_ResetDone);
 		mpu.state.reset=false;
 	}
+#endif
 	//LOG(LOG_MISC,LOG_NORMAL)("MPU401:command %x",val);
 	SDL_mutexP(MPULock);
 
@@ -1277,15 +1265,17 @@ void MPU401_InputMsg(Bit8u msg[4]) {
 		return;
 	}
 	//UART mode input
-	SDL_mutexP(GUSLock);
+	SDL_mutexP(MPULock);
 	for (Bitu i=0;i<len;i++) MPU401_QueueByte(msg[i]);
-	SDL_mutexV(GUSLock);
+	SDL_mutexV(MPULock);
 	SB16_MPU401_IrqToggle(true);
 }
 
 
 static void MPU401_ResetDone(Bitu) {
+#if 0
 	mpu.state.reset=false;
+#endif
 	if (mpu.state.cmd_pending) {
 		MPU401_WriteCommand(0x331,mpu.state.cmd_pending-1,1);
 		mpu.state.cmd_pending=0;

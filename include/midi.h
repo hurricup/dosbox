@@ -24,6 +24,8 @@
 #include "programs.h"
 #endif
 
+#include "SDL_thread.h"
+
 class MidiHandler {
 public:
 	MidiHandler();
@@ -40,6 +42,32 @@ public:
 
 
 #define SYSEX_SIZE 8192
+#define MIDI_DEVS 4
+enum {MOUT_MPU,MOUT_SBUART,MOUT_GUS,MOUT_THRU};
+
+enum {MDEV_MPU,MDEV_SBUART,MDEV_GUS,MDEV_SB16,MDEV_NONE};
+
+void MIDI_RawOutByte(Bit8u data, Bit8u slot);
+void MIDI_RawOutRTByte(Bit8u data);
+void MIDI_RawOutThruRTByte(Bit8u data);
+void MIDI_ClearBuffer(Bit8u slot);
+bool MIDI_Available(void);
+
+void MPU401_InputMsg(Bit8u msg[4]);
+void SB_UART_InputMsg(Bit8u msg[4]);
+void GUS_UART_InputMsg(Bit8u msg[4]);
+
+Bits MPU401_InputSysex(Bit8u* buffer,Bitu len,bool abort);
+Bits SB_UART_InputSysex(Bit8u* buffer,Bitu len,bool abort);
+Bits GUS_UART_InputSysex(Bit8u* buffer,Bitu len,bool abort);
+
+void MPU401_SetupTxHandler(void);
+void MPU401_SetTx(bool status);
+
+void SB16_MPU401_IrqToggle(bool status);
+
+Bit32s MIDI_ToggleInputDevice(Bit32u device,bool status);
+
 struct DB_Midi {
 	Bit8u rt_buf[8];
 		Bitu status[MIDI_DEVS];

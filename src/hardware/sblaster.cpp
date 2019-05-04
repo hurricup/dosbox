@@ -856,6 +856,7 @@ Bitu DEBUG_EnableDebugger(void);
 #define DSP_SB2_ABOVE if (sb.type <= SBT_1) { LOG(LOG_SB,LOG_ERROR)("DSP:Command %2X requires SB2 or above",sb.dsp.cmd); break; } 
 
 static void DSP_DoCommand(void) {
+    bool tmpmidi = false;
 //	LOG_MSG("DSP Command %X",sb.dsp.cmd);
 	switch (sb.dsp.cmd) {
 	case 0x04:
