@@ -71,46 +71,12 @@ public:
 		isOpen=true;
 		return true;
 	};
-	bool OpenInput(const char *inconf) {
-		if (isOpenInput) return false;
-		void * midiInCallback=Win32_midiInCallback;
-		MMRESULT res;
-		if(inconf && *inconf) {
-			std::string strinconf(inconf);
-			std::istringstream configmidiin(strinconf);
-			unsigned int nummer = midiInGetNumDevs();
-			configmidiin >> nummer;
-			if(nummer < midiInGetNumDevs()){
-				MIDIINCAPS mididev;
-				midiInGetDevCaps(nummer, &mididev, sizeof(MIDIINCAPS));
-				LOG_MSG("MIDI:win32 selected input %s",mididev.szPname);
-				res = midiInOpen (&m_in, nummer, (DWORD_PTR)midiInCallback, 0, CALLBACK_FUNCTION);
-			}
-		} else {
-			res = midiInOpen(&m_in, MIDI_MAPPER, (DWORD_PTR)midiInCallback, 0, CALLBACK_FUNCTION);
-		}
-		if (res != MMSYSERR_NOERROR) return false;
 
-		m_inhdr.lpData = (char*)&MIDI_InSysexBuf[0];
-		m_inhdr.dwBufferLength = SYSEX_SIZE;
-		m_inhdr.dwBytesRecorded = 0 ;
-		m_inhdr.dwUser = 0;
-		midiInPrepareHeader(m_in,&m_inhdr,sizeof(m_inhdr));
-		midiInStart(m_in);
-		isOpenInput=true;
-		return true;
-	};
 	void Close(void) {
-		if (isOpen) {
-			isOpen=false;
-			midiOutClose(m_out);
-			CloseHandle (m_event);
-		}
-		if (isOpenInput) {
-			isOpenInput=false;
-			midiInStop(m_in);
-			midiInClose(m_in);
-		}
+		if (!isOpen) return;
+		isOpen=false;
+		midiOutClose(m_out);
+		CloseHandle (m_event);
 	};
 	void PlayMsg(Bit8u * msg) {
 		midiOutShortMsg(m_out, *(Bit32u*)msg);

@@ -1,0 +1,33 @@
+--- src/dosbox.cpp	13 Dec 2007 12:38:13 -0000	1.124
++++ src/dosbox.cpp	6 Jan 2008 23:20:23 -0000
+@@ -379,13 +379,19 @@
+ 	secprop->Add_string("mpu401","intelligent");
+ 	secprop->Add_string("device","default");
+ 	secprop->Add_string("config","");
++	secprop->Add_string("inconfig","none");
++	secprop->Add_string("midioptions","autoinput");
++
+ 	
+ 	MSG_Add("MIDI_CONFIGFILE_HELP",
+ 		"mpu401      -- Type of MPU-401 to emulate: none, uart or intelligent.\n"
+-		"device      -- Device that will receive the MIDI data from MPU-401.\n"
++		"device      -- Device(s) that will receive or send the MIDI data to/from MPU-401.\n"
+ 		"               This can be default,alsa,oss,win32,coreaudio,coremidi,none.\n"
+-		"config      -- Special configuration options for the device. In Windows put\n" 
++		"config      -- Special configuration options for the output device. In Windows put\n"
+ 		"               the id of the device you want to use. See README for details.\n"
++		"inconfig    -- Special configuration options for the input device.\n"
++		"midioptions -- Multiple MIDI options separated by a comma.\n"
++		"               Also includes selection of internal input device.\n"
+ 	);
+ 
+ #if C_DEBUG
+@@ -417,7 +423,7 @@
+ 	secprop->Add_int("gusrate",22050);
+ 	secprop->Add_hex("gusbase",0x240);
+ 	secprop->Add_int("irq1",5);
+-	secprop->Add_int("irq2",5);
++	secprop->Add_int("irq2",11);
+ 	secprop->Add_int("dma1",3);
+ 	secprop->Add_int("dma2",3);
+ 	secprop->Add_string("ultradir","C:\\ULTRASND");

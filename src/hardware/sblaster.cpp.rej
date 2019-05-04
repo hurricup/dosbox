@@ -1,0 +1,107 @@
+--- src/hardware/sblaster.cpp	20 Sep 2007 16:42:43 -0000	1.67
++++ src/hardware/sblaster.cpp	6 Jan 2008 23:20:28 -0000
+@@ -666,6 +689,8 @@
+ 	sb.dsp.cmd_len=0;
+ 	sb.dsp.in.pos=0;
+ 	sb.dsp.write_busy=0;
++	SB_MIDIIN_OFF(false);
++	MIDI_ClearBuffer(MOUT_SBUART);
+ 	sb.dma.left=0;
+ 	sb.dma.total=0;
+ 	sb.dma.stereo=false;
+@@ -726,10 +751,11 @@
+ 
+ static void DSP_DoCommand(void) {
+ //	LOG_MSG("DSP Command %X",sb.dsp.cmd);
++	bool tmpmidi;
+ 	switch (sb.dsp.cmd) {
+ 	case 0x04:	/* DSP Status SB 2.0/pro version. NOT SB16. */
+ 		DSP_FlushData();
+-		DSP_AddData(0xff);			//Everthing enabled
++		DSP_AddData(0xff);	//Everthing enabled
+ 		break;
+ 	case 0x10:	/* Direct DAC */
+ 		DSP_ChangeMode(MODE_DAC);
+@@ -971,12 +1025,14 @@
+ static Bit8u DSP_ReadData(void) {
+ /* Static so it repeats the last value on succesive reads (JANGLE DEMO) */
+ 	static Bit8u data = 0;
++	SDL_mutexP(SBLock);
+ 	if (sb.dsp.out.used) {
+ 		data=sb.dsp.out.data[sb.dsp.out.pos];
+ 		sb.dsp.out.pos++;
+ 		if (sb.dsp.out.pos>=DSP_BUFSIZE) sb.dsp.out.pos-=DSP_BUFSIZE;
+ 		sb.dsp.out.used--;
+ 	}
++	SDL_mutexV(SBLock);
+ 	return data;
+ }
+ 
+@@ -1246,8 +1302,9 @@
+ 		}
+ 		return ret;
+ 	case 0x82:		/* IRQ Status */
+-		return	(sb.irq.pending_8bit ? 0x1 : 0) |
+-				(sb.irq.pending_16bit ? 0x2 : 0);
++		return	(sb.irq.pending_8bit   ? 0x1 : 0) |
++				(sb.irq.pending_16bit  ? 0x2 : 0) |
++				(sb.irq.pending_mpuirq ? 0x4 : 0);
+ 	default:
+ 		if (	((sb.type == SBT_PRO1 || sb.type == SBT_PRO2) && sb.mixer.index==0x0c) || /* Input control on SBPro */
+ 			(sb.type == SBT_16 && sb.mixer.index >= 0x3b && sb.mixer.index <= 0x47)) /* New SB16 registers */
+@@ -1306,7 +1368,8 @@
+ 		DSP_DoReset(val);
+ 		break;
+ 	case DSP_WRITE_DATA:
+-		DSP_DoWrite(val);
++		if (sb.dsp.midiout_raw) MIDI_RawOutByte(val,MOUT_SBUART);
++		else DSP_DoWrite(val);
+ 		break;
+ 	case MIXER_INDEX:
+ 		sb.mixer.index=val;
+@@ -1455,7 +1567,7 @@
+ 		sb.mixer.stereo=false;
+ 		OPL_Mode opl_mode = OPL_none;
+ 		Find_Type_And_Opl(section,sb.type,opl_mode);
+-	
++
+ 		switch (opl_mode) {
+ 		case OPL_none:
+ 			WriteHandler[0].Install(0x388,adlib_gusforward,IO_MB);
+@@ -1503,13 +1615,15 @@
+ 		/* Soundblaster midi interface */
+ 		if (!MIDI_Available()) sb.midi = false;
+ 		else sb.midi = true;
++
++		SBLock = SDL_CreateMutex();
+ 	}	
+ 	
+ 	~SBLASTER() {
+ 	Section_prop * section=static_cast<Section_prop *>(m_configuration);
+ 		OPL_Mode opl_mode = OPL_none;
+ 		Find_Type_And_Opl(section,sb.type,opl_mode);
+-	
++
+ 		switch (opl_mode) {
+ 		case OPL_none:
+ 
+@@ -1527,14 +1641,16 @@
+ 		}
+ 
+ 		if (sb.type==SBT_NONE) return;
+-		DSP_Reset();//Stop everything	
+-	}	
++		DSP_Reset();//Stop everything
++		SDL_DestroyMutex(SBLock);
++		SBLock=0;
++	}
+ }; //End of SBLASTER class
+ 
+ 
+ static SBLASTER* test;
+ void SBLASTER_ShutDown(Section* sec) {
+-	delete test;	
++	delete test;
+ }
+ 
+ void SBLASTER_Init(Section* sec) {

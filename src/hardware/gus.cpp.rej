@@ -1,0 +1,11 @@
+--- src/hardware/gus.cpp	20 Sep 2007 16:42:43 -0000	1.32
++++ src/hardware/gus.cpp	6 Jan 2008 23:20:27 -0000
+@@ -994,6 +1110,8 @@
+ 
+ 		memset(&myGUS,0,sizeof(myGUS));
+ 		memset(GUSRam,0,1024*1024);
++		SDL_DestroyMutex(GUSLock);
++		GUSLock=0;
+ 		}
+ };
+ 
