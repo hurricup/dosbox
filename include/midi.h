@@ -27,7 +27,8 @@
 class MidiHandler {
 public:
 	MidiHandler();
-	virtual bool Open(const char * /*conf*/) { return true; };
+	virtual bool Open(const char * conf) { return true; };
+	virtual bool OpenInput(const char * inconf) {return false;};
 	virtual void Close(void) {};
 	virtual void PlayMsg(Bit8u * /*msg*/) {};
 	virtual void PlaySysex(Bit8u * /*sysex*/,Bitu /*len*/) {};
@@ -40,19 +41,29 @@ public:
 
 #define SYSEX_SIZE 8192
 struct DB_Midi {
-	Bitu status;
-	Bitu cmd_len;
-	Bitu cmd_pos;
-	Bit8u cmd_buf[8];
 	Bit8u rt_buf[8];
+		Bitu status[MIDI_DEVS];
+		Bitu cmd_r;
+	struct {
+		Bitu len;
+		Bitu pos;
+		Bit8u buf[8];
+	} cmd[MIDI_DEVS];
 	struct {
 		Bit8u buf[SYSEX_SIZE];
 		Bitu used;
 		Bitu delay;
 		Bit32u start;
-	} sysex;
+	} sysex[MIDI_DEVS];
 	bool available;
+	bool in_available;
 	MidiHandler * handler;
+	MidiHandler * in_handler;
+	bool realtime;
+	Bitu inputdev;
+	bool autoinput;
+	bool thruchan;
+	bool clockout;
 };
 
 extern DB_Midi midi;
