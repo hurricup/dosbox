@@ -24,24 +24,43 @@
 #include "setup.h"
 #include "cpu.h"
 #include "support.h"
+#include "mixer.h"
+#include "midi.h"
 
-void MIDI_RawOutByte(Bit8u data);
-bool MIDI_Available(void);
+SDL_mutex * MPULock;
+
+//metronome sound
+#define MPU401_METRONOME 1
 
 static void MPU401_Event(Bitu);
 static void MPU401_Reset(void);
 static void MPU401_ResetDone(Bitu);
 static void MPU401_EOIHandler(Bitu val=0);
 static void MPU401_EOIHandlerDispatch(void);
+static void MPU401_IntelligentOut(Bitu data);
+static void MPU401_WriteCommand(Bitu port,Bitu val,Bitu iolen);
+static void MPU401_WriteData(Bitu port,Bitu val,Bitu iolen);
+static void MPU401_MetronomeSound(bool accented);
+static void MPU401_NotesOff(Bitu chan);
+static void MPU401_RecQueueBuffer(Bit8u * buf, Bitu len,bool block);
 
 #define MPU401_VERSION	0x15
 #define MPU401_REVISION	0x01
-#define MPU401_QUEUE 32
+#define MPU401_QUEUE 64
+#define MPU401_INPUT_QUEUE 1024
 #define MPU401_TIMECONSTANT (60000000/1000.0f)
 #define MPU401_RESETBUSY 14.0f
 
+//helpers
+#define M_GETKEY key[key/32]&(1<<(key%32))
+#define M_SETKEY key[key/32]|=(1<<(key%32))
+#define M_DELKEY key[key/32]&=~(1<<(key%32))
+
 enum MpuMode { M_UART,M_INTELLIGENT };
 enum MpuDataType {T_OVERFLOW,T_MARK,T_MIDI_SYS,T_MIDI_NORM,T_COMMAND};
+enum RecState { M_RECOFF,M_RECSTB,M_RECON };
+static Bitu MPUClockBase[8]={48,72,96,120,144,168,192};
+static Bit8u cth_data[16]={0,0,0,0,1,0,0,0,1,0,1,0,1,1,1,0};
 
 static void MPU401_WriteData(Bitu port,Bitu val,Bitu iolen);
 
@@ -59,59 +78,202 @@ static void MPU401_WriteData(Bitu port,Bitu val,Bitu iolen);
 
 static struct {
 	bool intelligent;
-	MpuMode mode;
 	Bitu irq;
+	bool midi_thru;
+	IO_ReadHandleObject ReadHandler[2];
+	IO_WriteHandleObject WriteHandler[2];
+
+#ifdef MPU401_METRONOME
+	struct {
+		Bit8u emptyBuf[MIXER_BUFSIZE];
+		Bit8u majorBeat[MIXER_BUFSIZE];
+		Bit8u minorBeat[MIXER_BUFSIZE];
+		MixerChannel * mixerChan;
+		MixerObject mixObj;
+		Bit32s duration;
+		bool gen;
+		bool accent;
+	} metronome;
+#endif
+
+} mpuhw;
+
+static struct {
+	MpuMode mode;
 	Bit8u queue[MPU401_QUEUE];
 	Bitu queue_pos,queue_used;
+
+	Bit8u rec_queue[MPU401_INPUT_QUEUE];
+	Bitu rec_queue_pos,rec_queue_used;
 	struct track {
 		Bits counter;
-		Bit8u value[8],sys_val;
-		Bit8u vlength,length;
+		Bit8u value[3],sys_val;
+		Bit8u length;
 		MpuDataType type;
 	} playbuf[8],condbuf;
 	struct {
-		bool conductor,cond_req,cond_set, block_ack;
-		bool playing,reset;
 		bool wsd,wsm,wsd_start;
 		bool run_irq,irq_pending;
+		bool tx_ready;
+		bool conductor,cond_req,cond_set;
+		bool track_req;
+		bool block_ack;
+		bool playing;
 		bool send_now;
+		bool clock_to_host;
+		bool sync_in;
+		bool sysex_in_finished;
+		bool rec_copy;
+		RecState rec;
 		bool eoi_scheduled;
 		Bits data_onoff;
 		Bitu command_byte,cmd_pending;
 		Bit8u tmask,cmask,amask;
 		Bit16u midi_mask;
 		Bit16u req_mask;
-		Bit8u channel,old_chan;
+		Bitu track,old_track;
+		Bit8u last_rtcmd;
 	} state;
 	struct {
 		Bit8u timebase,old_timebase;
 		Bit8u tempo,old_tempo;
 		Bit8u tempo_rel,old_tempo_rel;
 		Bit8u tempo_grad;
-		Bit8u cth_rate,cth_counter;
-		bool clock_to_host,cth_active;
+		Bit8u cth_rate[4],cth_mode;
+		Bit8u midimetro,metromeas;
+		Bitu metronome_state;
+		Bitu cth_counter,cth_old;
+		Bitu rec_counter;
+		Bit32s measure_counter,meas_old;
+		Bitu metronome_counter;
+		Bit32s freq;
+		Bits ticks_in;
+		float freq_mod;
+		bool active;
+		Bit8u cth_rate[4],cth_mode;
+		Bit8u midimetro,metromeas;
+		Bitu metronome_state;
+		Bitu cth_counter,cth_old;
+		Bitu rec_counter;
+		Bit32s measure_counter,meas_old;
+		Bitu metronome_counter;
+		Bit32s freq;
+		Bits ticks_in;
+		float freq_mod;
+		bool active;
 	} clock;
+	struct {
+		bool all_thru,midi_thru,sysex_thru,commonmsgs_thru;
+		bool modemsgs_in, commonmsgs_in, bender_in, sysex_in;
+		bool allnotesoff_out;
+		bool rt_affection, rt_out,rt_in;
+		bool timing_in_stop;
+		bool data_in_stop;
+		bool rec_measure_end;
+		Bit8u prchg_buf[16];
+		Bit16u prchg_mask;
+	} filter;
+	Bitu ch_toref[16];
+	struct {
+		Bit8u chan;
+		Bit32u key[4];
+		Bit8u trmask;
+		bool on;
+	}chanref[5],inputref[16];
 } mpu;
 
+static void MPU401_ReCalcClock(void) {
+	Bit32s maxtempo=240, mintempo=16;
+	if (mpu.clock.timebase>=168) maxtempo=179;
+	if (mpu.clock.timebase==144) maxtempo=208;
+	if (mpu.clock.timebase>=120) mintempo=8;
+	mpu.clock.freq=(Bit32u(mpu.clock.tempo*2*mpu.clock.tempo_rel))>>6;
 
-static void QueueByte(Bit8u data) {
+	mpu.clock.freq=mpu.clock.timebase*
+		(mpu.clock.freq<(mintempo*2) ? mintempo : 
+		((mpu.clock.freq/2)<maxtempo?(mpu.clock.freq/2):maxtempo) );
+
+	if (mpu.state.sync_in) {
+		Bit32s freq= Bit32s(float(mpu.clock.freq)*mpu.clock.freq_mod);
+		if (freq>mpu.clock.timebase*mintempo && freq<mpu.clock.timebase*maxtempo) 
+			mpu.clock.freq=freq;
+	}
+}
+
+static INLINE void MPU401_StartClock(void) {
+	if (mpu.clock.active) return;
+	if (!(mpu.state.clock_to_host || mpu.state.playing || mpu.state.rec==M_RECON)) return;
+	mpu.clock.active=true;
+	PIC_RemoveEvents(MPU401_Event);
+	PIC_AddEvent(MPU401_Event,MPU401_TIMECONSTANT/mpu.clock.freq);
+}
+
+static void MPU401_StopClock(void) {
+	if (mpu.state.playing || mpu.state.rec!=M_RECON || mpu.state.clock_to_host)  return;
+	mpu.clock.active=false;
+	PIC_RemoveEvents(MPU401_Event);
+}
+
+static INLINE void MPU401_RunClock(void) {
+	if (!mpu.clock.active) return;
+	PIC_RemoveEvents(MPU401_Event);
+	PIC_AddEvent(MPU401_Event,MPU401_TIMECONSTANT/(mpu.clock.freq));
+}
+
+static INLINE void MPU401_QueueByte(Bit8u data) {
 	if (mpu.state.block_ack) {mpu.state.block_ack=false;return;}
-	if (mpu.queue_used==0 && mpu.intelligent) {
 		mpu.state.irq_pending=true;
-		PIC_ActivateIRQ(mpu.irq);
+		PIC_ActivateIRQ(mpuhw.irq);
 	}
 	if (mpu.queue_used<MPU401_QUEUE) {
 		Bitu pos=mpu.queue_used+mpu.queue_pos;
-		if (mpu.queue_pos>=MPU401_QUEUE) mpu.queue_pos-=MPU401_QUEUE;
 		if (pos>=MPU401_QUEUE) pos-=MPU401_QUEUE;
 		mpu.queue_used++;
 		mpu.queue[pos]=data;
-	} else LOG(LOG_MISC,LOG_NORMAL)("MPU401:Data queue full");
+	}
 }
 
-static void ClrQueue(void) {
+static void MPU401_RecQueueBuffer(Bit8u * buf, Bitu len,bool block) {
+	if (block) {
+		if (MPULock) SDL_mutexP(MPULock);
+		else return;
+	}
+	Bitu cnt=0;
+	while (cnt<len) {
+		if (mpu.rec_queue_used<MPU401_INPUT_QUEUE) {
+			Bitu pos=mpu.rec_queue_used+mpu.rec_queue_pos;
+			if (pos>=MPU401_INPUT_QUEUE) {pos-=MPU401_INPUT_QUEUE;}
+			mpu.rec_queue[pos]=buf[cnt];
+			mpu.rec_queue_used++;
+			if (!mpu.state.sysex_in_finished && buf[cnt]==MSG_EOX) {//finish sysex
+				mpu.state.sysex_in_finished=true;
+				break;
+			}
+			cnt++;
+		}
+	}
+	if (mpu.queue_used==0) {
+		if (mpu.state.rec_copy || mpu.state.irq_pending) {
+			if (block && MPULock) SDL_mutexV(MPULock);
+			return;
+		}
+		mpu.state.rec_copy=true;
+		if (mpu.rec_queue_pos>=MPU401_INPUT_QUEUE) mpu.rec_queue_pos-=MPU401_INPUT_QUEUE;
+		MPU401_QueueByte(mpu.rec_queue[mpu.rec_queue_pos]);
+		mpu.rec_queue_used--;
+		mpu.rec_queue_pos++;
+	}
+	if (block && MPULock) SDL_mutexV(MPULock);
+}
+
+static void MPU401_ClrQueue(void) {
 	mpu.queue_used=0;
 	mpu.queue_pos=0;
+	mpu.rec_queue_used=0;
+	mpu.rec_queue_pos=0;
+	mpu.state.sysex_in_finished=true;
+	mpu.state.irq_pending=false;
+	SB16_MPU401_IrqToggle(false);
 }
 
 static Bitu MPU401_ReadStatus(Bitu port,Bitu iolen) {
