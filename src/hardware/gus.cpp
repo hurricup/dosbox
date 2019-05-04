@@ -1024,6 +1024,8 @@ public:
 
 		memset(&myGUS,0,sizeof(myGUS));
 		memset(GUSRam,0,1024*1024);
+		SDL_DestroyMutex(GUSLock);
+		GUSLock=0;
 	}
 };
 
