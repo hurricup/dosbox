@@ -595,19 +595,41 @@ static void MPU401_WriteCommand(Bitu port,Bitu val,Bitu iolen) {
 
 static Bitu MPU401_ReadData(Bitu port,Bitu iolen) {
 	Bit8u ret=MSG_MPU_ACK;
+	SDL_mutexP(MPULock);
 	if (mpu.queue_used) {
 		if (mpu.queue_pos>=MPU401_QUEUE) mpu.queue_pos-=MPU401_QUEUE;
 		ret=mpu.queue[mpu.queue_pos];
 		mpu.queue_pos++;mpu.queue_used--;
 	}
-	if (!mpu.intelligent) return ret;
 
-	if (mpu.queue_used == 0) PIC_DeActivateIRQ(mpu.irq);
+	if (mpu.mode==M_UART) {
+		if (!mpu.queue_used) SB16_MPU401_IrqToggle(false);
+		//else SB16_MPU401_IrqToggle(true);
+		if (mpuhw.intelligent && !mpu.queue_used) PIC_DeActivateIRQ(mpuhw.irq);
+		SDL_mutexV(MPULock);
+		return ret;
+	}
+	if (mpu.state.rec_copy && !mpu.rec_queue_used) {
+		mpu.state.rec_copy=false;
+		MPU401_EOIHandler();
+		SDL_mutexV(MPULock);
+		//LOG(LOG_MISC,LOG_NORMAL)("MPU401:read data eoi %x", ret);
+		return ret;
+	}
 
+	//copy from recording buffer
+	if (!mpu.queue_used && mpu.rec_queue_used) {
+		mpu.state.rec_copy=true;
+		if (mpu.rec_queue_pos>=MPU401_INPUT_QUEUE) mpu.rec_queue_pos-=MPU401_INPUT_QUEUE;
+		MPU401_QueueByte(mpu.rec_queue[mpu.rec_queue_pos]);
+		mpu.rec_queue_pos++;mpu.rec_queue_used--;
+	}
+	if (!mpu.queue_used) PIC_DeActivateIRQ(mpuhw.irq);
 	if (ret>=0xf0 && ret<=0xf7) { /* MIDI data request */
-		mpu.state.channel=ret&7;
+		mpu.state.track=ret&7;
 		mpu.state.data_onoff=0;
 		mpu.state.cond_req=false;
+		mpu.state.track_req=true;
 	}
 	if (ret==MSG_MPU_COMMAND_REQ) {
 		mpu.state.data_onoff=0;
@@ -616,13 +638,15 @@ static Bitu MPU401_ReadData(Bitu port,Bitu iolen) {
 			mpu.state.block_ack=true;
 			MPU401_WriteCommand(0x331,mpu.condbuf.value[0],1);
 			if (mpu.state.command_byte) MPU401_WriteData(0x330,mpu.condbuf.value[1],1);
+            mpu.condbuf.type=T_OVERFLOW;
 		}
-	mpu.condbuf.type=T_OVERFLOW;
 	}
-	if (ret==MSG_MPU_END || ret==MSG_MPU_CLOCK || ret==MSG_MPU_ACK) {
-		mpu.state.data_onoff=-1;
+	if (ret==MSG_MPU_END || ret==MSG_MPU_CLOCK || ret==MSG_MPU_ACK || ret==MSG_MPU_OVERFLOW) {
 		MPU401_EOIHandlerDispatch();
 	}
+
+	SDL_mutexV(MPULock);
+	//LOG(LOG_MISC,LOG_NORMAL)("MPU401:read data %x", ret);
 	return ret;
 }
 
