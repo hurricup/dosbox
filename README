@@ -155,6 +155,20 @@ CD-ROM: My CD-ROM doesn't work.
                           for CD audio, otherwise it is ignored)
     See also the next question: The game/application can't find its CD-ROM.
 
+Q: MIDI output or input is not working
+A: Check your MIDI device configuration in Windows Control Panel. To manually
+    choose a device, modify "config" parameter in [midi] section. First value is
+    id number of a MIDI output device, followed by comma and output device.
+    By default, Dosbox will try to automatically select output device. To override,
+    try with "config=0" (on windows). Input is disabled by default unless you change the
+    "inconfig" parameter. If unsure, try with "inconfig=0" to enable MIDI input.
+    To force a MIDI input or output handler, try for example "device=default,win32".
+    Linux and OS X MIDI input are currently not supported.
+    With the "midioptions" setting you can select emulated MIDI device which receives
+    MIDI input. Available devices are: inputmpu401, inputsbuart, inputgus and inputauto.
+    Other options are separated by a comma: "norealtime" option disables output
+    of realtime MIDI messages, "passthrough" enables MIDI passthrough and "clockout"
+    allows output of MIDI clock realtime messages (only works without "norealtime").
 
 CD-ROM: The game/application can't find its CD-ROM.
     Be sure to mount the CD-ROM with -t cdrom switch, this will enable the

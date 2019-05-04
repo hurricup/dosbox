@@ -569,6 +569,8 @@ void DOSBOX_Init(void) {
 	                  "In that case, add 'delaysysex', for example: midiconfig=2 delaysysex\n"
 	                  "See the README/Manual for more details.");
 
+	secprop->Add_string("inconfig", Property::Changeable::OnlyAtStart, "none");
+	secprop->Add_string("midioptions", Property::Changeable::OnlyAtStart, "autoinput");
 #if C_DEBUG
 	secprop=control->AddSection_prop("debug",&DEBUG_Init);
 #endif
