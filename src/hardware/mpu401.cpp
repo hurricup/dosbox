@@ -878,40 +878,65 @@ static void MPU401_WriteData(Bitu port,Bitu val,Bitu iolen) {
 	return;
 }
 
-static void MPU401_IntelligentOut(Bit8u chan) {
-	Bitu val;
-	switch (mpu.playbuf[chan].type) {
+static void MPU401_IntelligentOut(Bitu track) {
+	Bitu chan,chrefnum;
+	Bit8u key,msg;
+	bool send,retrigger;
+	switch (mpu.playbuf[track].type) {
 		case T_OVERFLOW:
 			break;
 		case T_MARK:
-			val=mpu.playbuf[chan].sys_val;
-			if (val==0xfc) {
-				MIDI_RawOutByte(val);
-				mpu.state.amask&=~(1<<chan);
-				mpu.state.req_mask&=~(1<<chan);
+			if (mpu.playbuf[track].sys_val==0xfc) {
+				MIDI_RawOutRTByte(mpu.playbuf[track].sys_val);
+				mpu.state.amask&=~(1<<track);
 			}
 			break;
 		case T_MIDI_NORM:
-			for (Bitu i=0;i<mpu.playbuf[chan].vlength;i++)
-				MIDI_RawOutByte(mpu.playbuf[chan].value[i]);
-			break;
-		default:
-			break;
+				chan=mpu.playbuf[track].value[0]&0xf;
+				key=mpu.playbuf[track].value[1]&0x7f;
+				chrefnum=mpu.ch_toref[chan];
+				send=true;
+				retrigger=false;
+			switch (msg=mpu.playbuf[track].value[0]&0xf0) {
+				case 0x80: //note off
+					if (mpu.inputref[chan].on && (mpu.inputref[chan].M_GETKEY)) send=false;
+					if (mpu.chanref[chrefnum].on && (!mpu.chanref[chrefnum].M_GETKEY)) send=false;
+					mpu.chanref[chrefnum].M_DELKEY;
+					break;
+				case 0x90: //note on
+					if (mpu.inputref[chan].on && (mpu.inputref[chan].M_GETKEY)) retrigger=true;
+					if (mpu.chanref[chrefnum].on && (mpu.chanref[chrefnum].M_GETKEY)) retrigger=true;
+					mpu.chanref[chrefnum].M_SETKEY;
+					break;
+				case 0xb0:			
+					if (mpu.playbuf[track].value[1]==123) {/* All notes off */
+						MPU401_NotesOff(mpu.playbuf[track].value[0]&0xf);
+						return;
+					}
+					break;
+			}
+			if (retrigger) {
+					MIDI_RawOutByte(0x80|chan,MOUT_MPU);
+					MIDI_RawOutByte(key,MOUT_MPU);
+					MIDI_RawOutByte(0,MOUT_MPU);
+			}
+			if (send) for (Bitu i=0;i<mpu.playbuf[track].length;i++)
+					MIDI_RawOutByte(mpu.playbuf[track].value[i],MOUT_MPU);
 	}
 }
 
-static void UpdateTrack(Bit8u chan) {
-	MPU401_IntelligentOut(chan);
-	if (mpu.state.amask&(1<<chan)) {
-		mpu.playbuf[chan].vlength=0;
-		mpu.playbuf[chan].type=T_OVERFLOW;
-		mpu.playbuf[chan].counter=0xf0;
-		mpu.state.req_mask|=(1<<chan);
+static void UpdateTrack(Bit8u track) {
+	MPU401_IntelligentOut(track);
+	if (mpu.state.amask&(1<<track)) {
+		mpu.playbuf[track].type=T_OVERFLOW;
+		mpu.playbuf[track].counter=0xf0;
+		mpu.state.req_mask|=(1<<track);
 	} else {
 		if (mpu.state.amask==0 && !mpu.state.conductor) mpu.state.req_mask|=(1<<12);
 	}
 }
 
+#if 0
 static void UpdateConductor(void) {
 	if (mpu.condbuf.value[0]==0xfc) {
 		mpu.condbuf.value[0]=0;
@@ -924,32 +949,74 @@ static void UpdateConductor(void) {
 	mpu.condbuf.counter=0xf0;
 	mpu.state.req_mask|=(1<<9);
 }
+#endif
 
+//Timer event for hw sequencer
 static void MPU401_Event(Bitu val) {
+
 	if (mpu.mode==M_UART) return;
+
 	if (mpu.state.irq_pending) goto next_event;
-	for (Bitu i=0;i<8;i++) { /* Decrease counters */
-		if (mpu.state.amask&(1<<i)) {
-			mpu.playbuf[i].counter--;
-			if (mpu.playbuf[i].counter<=0) UpdateTrack(i);
+	if (mpu.state.playing) {
+		for (Bitu i=0;i<8;i++) { /* Decrease counters */
+			if (mpu.state.amask&(1<<i)) {
+				mpu.playbuf[i].counter--;
+				if (mpu.playbuf[i].counter<=0) UpdateTrack(i);
+			}
+		}
+		if (mpu.state.conductor) {
+			mpu.condbuf.counter--;
+			if (mpu.condbuf.counter<=0) {
+					mpu.condbuf.counter=0xf0;
+					mpu.state.req_mask|=(1<<9);
+			}
 		}
 	}
-	if (mpu.state.conductor) {
-		mpu.condbuf.counter--;
-		if (mpu.condbuf.counter<=0) UpdateConductor();
-	}
-	if (mpu.clock.clock_to_host) {
+	if (mpu.state.clock_to_host) {
 		mpu.clock.cth_counter++;
-		if (mpu.clock.cth_counter >= mpu.clock.cth_rate) {
+		if (mpu.clock.cth_counter >= mpu.clock.cth_rate[mpu.clock.cth_mode]) {
 			mpu.clock.cth_counter=0;
+			mpu.clock.cth_mode=(++mpu.clock.cth_mode)%4;
 			mpu.state.req_mask|=(1<<13);
 		}
 	}
-	if (!mpu.state.irq_pending && mpu.state.req_mask) MPU401_EOIHandler();
+	if (mpu.state.rec==M_RECON) { //recording
+		mpu.clock.rec_counter++;
+		if (mpu.clock.rec_counter>=240) {
+			mpu.clock.rec_counter=0;
+			mpu.state.req_mask|=(1<<8);
+		}
+	}
+	bool accented;
+	if (mpu.state.playing || mpu.state.rec==M_RECON) {
+		accented=false;
+		Bits max_meascnt = (mpu.clock.timebase*mpu.clock.midimetro*mpu.clock.metromeas)/24;
+		if (max_meascnt!=0) { //measure end
+			if (++mpu.clock.measure_counter>=max_meascnt) {
+				if (mpu.filter.rt_out) MIDI_RawOutRTByte(0xf8);
+				mpu.clock.measure_counter=0;
+				if (mpu.filter.rec_measure_end && mpu.state.rec==M_RECON) 
+					mpu.state.req_mask|=(1<<12);
+
+				#ifdef MPU401_METRONOME
+				if (mpu.clock.metronome_state==2) MPU401_MetronomeSound(accented=true);
+				#endif
+			}
+		}
+		#ifdef MPU401_METRONOME
+		if (mpu.clock.metronome_state && !accented)
+			if (!(mpu.clock.measure_counter%(mpu.clock.timebase/24*mpu.clock.midimetro)))
+				MPU401_MetronomeSound(false);
+		#endif
+	}
+	if (!mpu.state.irq_pending && mpu.state.req_mask) {
+		SDL_mutexP(MPULock);
+		MPU401_EOIHandler();
+		SDL_mutexV(MPULock);
+	}
 next_event:
-	Bitu new_time;
-	if ((new_time=mpu.clock.tempo*mpu.clock.timebase)==0) return;
-	PIC_AddEvent(MPU401_Event,MPU401_TIMECONSTANT/new_time);
+	MPU401_RunClock();
+	if (mpu.state.sync_in) mpu.clock.ticks_in++;
 }
 
 
