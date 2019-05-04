@@ -23,6 +23,7 @@
 #include "dosbox.h"
 #include "inout.h"
 #include "mixer.h"
+#include "midi.h"
 #include "dma.h"
 #include "pic.h"
 #include "setup.h"
@@ -40,6 +41,8 @@ using namespace std;
 //Amount of precision the volume has
 #define RAMP_FRACT (10)
 #define RAMP_FRACT_MASK ((1 << RAMP_FRACT)-1)
+
+#define GUS_UART_QUEUE 64
 
 #define GUS_BASE myGUS.portbase
 #define GUS_RATE myGUS.rate
@@ -105,9 +108,19 @@ struct GFGus {
 	Bit8u IRQChan;
 	Bit32u RampIRQ;
 	Bit32u WaveIRQ;
+	//UART (MIDI)
+	bool uart_in,uart_out,uart_sysex;
+	Bit8u uart_queue[GUS_UART_QUEUE];
+	Bitu uart_used, uart_pos;
 } myGUS;
 
+SDL_mutex *GUSLock;
+
 Bitu DEBUG_EnableDebugger(void);
+void MIDI_RawOutByte(Bit8u data, Bit8u cb);
+
+static void GUS_UART_Queue(Bit8u data);
+static void GUS_UART_ClrQueue(void);
 
 static void GUS_DMA_Callback(DmaChannel * chan,DMAEvent event);
 
@@ -389,7 +402,7 @@ static void GUSReset(void) {
 }
 
 static INLINE void GUS_CheckIRQ(void) {
-	if (myGUS.IRQStatus && (myGUS.mixControl & 0x08)) 
+	if ((myGUS.IRQStatus & 0xfc) && (myGUS.mixControl & 0x08)) 
 		PIC_ActivateIRQ(myGUS.irq1);
 
 }
@@ -621,6 +634,7 @@ static void ExecuteGlobRegister(void) {
 
 static Bitu read_gus(Bitu port,Bitu iolen) {
 //	LOG_MSG("read from gus port %x",port);
+	Bit8u ret;
 	switch(port - GUS_BASE) {
 	case 0x206:
 		return myGUS.IRQStatus;
@@ -650,6 +664,27 @@ static Bitu read_gus(Bitu port,Bitu iolen) {
 		} else {
 			return 0;
 		}
+	case 0x300:
+		return  ( (myGUS.IRQStatus&0x3 ? 0x80:0) |
+			(myGUS.uart_in && myGUS.uart_used>=GUS_UART_QUEUE ? 0x20:0) |
+			((myGUS.uart_used && myGUS.uart_in)?1:0) | (myGUS.uart_out?2:0)
+			) ;
+	case 0x301:
+		ret=0;
+		if (myGUS.uart_in) {
+			SDL_mutexP(GUSLock);
+			if (myGUS.uart_used) {
+				if (myGUS.uart_pos>=GUS_UART_QUEUE) myGUS.uart_pos-=GUS_UART_QUEUE;
+				ret=myGUS.uart_queue[myGUS.uart_pos];
+				myGUS.uart_pos++;myGUS.uart_used--;
+			}
+			SDL_mutexV(GUSLock);
+			if (!myGUS.uart_used) {
+				myGUS.IRQStatus&=~0x2;
+			}
+		}
+		//LOG_MSG("GUS UART *READ data %x", ret);
+		return ret;	
 	default:
 #if LOG_GUS
 		LOG_MSG("Read GUS at port 0x%x", port);
@@ -732,6 +767,35 @@ static void write_gus(Bitu port,Bitu val,Bitu iolen) {
 	case 0x307:
 		if(myGUS.gDramAddr < sizeof(GUSRam)) GUSRam[myGUS.gDramAddr] = (Bit8u)val;
 		break;
+	case 0x300: //write command
+		//LOG_MSG("GUS UART cmd %x",val);
+		myGUS.uart_out=true;
+		if (val==3 || !val) {  //"normal operation" or reset
+				myGUS.uart_in=false;
+				myGUS.IRQStatus&=~0x3;
+				myGUS.uart_used=0;
+				//PIC_DeActivateIRQ(myGUS.irq2);
+			return;
+		}
+		if (val&0x20 /*&& !(val&0x40)*/) {
+			myGUS.IRQStatus|=0x01;
+		} else myGUS.IRQStatus&=~0x01;
+
+		if (val&0x80) { //start receiving
+			//enable host MIDI input (only in auto mode)
+			MIDI_ToggleInputDevice(MDEV_GUS,true);
+			myGUS.uart_in=true;
+		} else myGUS.uart_in=false;
+		break;
+	case 0x301: //write data
+		//LOG_MSG("GUS UART data %x",val);
+		if (myGUS.uart_out) {
+			MIDI_RawOutByte(val,MDEV_GUS);
+			PIC_ActivateIRQ(myGUS.irq2);
+			//if (myGUS.mixControl&0x8)
+			//	PIC_ActivateIRQ(myGUS.irq1);
+		}
+		break;
 	default:
 #if LOG_GUS
 		LOG_MSG("Write GUS at port 0x%x with %x", port, val);
@@ -809,10 +873,48 @@ static void MakeTables(void) {
 	}
 }
 
+static void GUS_UART_Queue(Bit8u data) {
+	if (myGUS.uart_used<GUS_UART_QUEUE) {
+		Bitu pos=myGUS.uart_used+myGUS.uart_pos;
+		if (pos>=GUS_UART_QUEUE) pos-=GUS_UART_QUEUE;
+		myGUS.uart_queue[pos]=data;
+		myGUS.uart_used++;
+	}
+	if (GUSLock) SDL_mutexV(GUSLock);
+}
+
+void GUS_UART_InputMsg(Bit8u msg[4]) {
+	if (myGUS.uart_sysex) return;
+	if (myGUS.uart_in) {
+		if (GUSLock) SDL_mutexP(GUSLock);
+		myGUS.IRQStatus|=0x2;
+		for (Bitu i=0;i<msg[3];i++) GUS_UART_Queue(msg[i]);
+		PIC_ActivateIRQ(myGUS.irq2);
+		if (GUSLock) SDL_mutexV(GUSLock);
+	}
+}
+
+Bits GUS_UART_InputSysex(Bit8u* buffer,Bitu len,bool abort) {
+	if (abort) {
+		myGUS.uart_used=0;
+		myGUS.uart_sysex=false;
+		return 0;
+	}
+	myGUS.uart_sysex=true;
+	if (GUSLock) SDL_mutexP(GUSLock);
+	for (Bitu i=0;i<len;i++) {
+	if (myGUS.uart_used>=GUS_UART_QUEUE) {if (GUSLock) SDL_mutexV(GUSLock);return (len-i);}
+		GUS_UART_Queue(buffer[i]);
+	}
+	if (GUSLock) SDL_mutexV(GUSLock);
+	myGUS.uart_sysex=false;
+	return 0;
+}
+
 class GUS:public Module_base{
 private:
-	IO_ReadHandleObject ReadHandler[8];
-	IO_WriteHandleObject WriteHandler[9];
+	IO_ReadHandleObject ReadHandler[10];
+	IO_WriteHandleObject WriteHandler[11];
 	AutoexecObject autoexecline[2];
 	MixerObject MixerChan;
 public:
@@ -860,15 +962,29 @@ public:
 	
 		WriteHandler[6].Install(0x307 + GUS_BASE,write_gus,IO_MB);
 		ReadHandler[6].Install(0x307 + GUS_BASE,read_gus,IO_MB);
-	
+
+		if (GUS_BASE!=0x30) {
+
+			//GUS MIDI port (command, status)
+			WriteHandler[7].Install(0x300 + GUS_BASE,write_gus,IO_MB);
+			ReadHandler[7].Install(0x300 + GUS_BASE,read_gus,IO_MB);
+			//GUS MIDI port (data)
+			WriteHandler[8].Install(0x301 + GUS_BASE,write_gus,IO_MB);
+			ReadHandler[8].Install(0x301 + GUS_BASE,read_gus,IO_MB);
+			myGUS.uart_out=true;
+		}
+		else LOG_MSG("GUS:Disabled UART: try different irq2 and/or gusbase");
+
 		// Board Only 
 	
-		WriteHandler[7].Install(0x200 + GUS_BASE,write_gus,IO_MB);
-		ReadHandler[7].Install(0x20A + GUS_BASE,read_gus,IO_MB);
-		WriteHandler[8].Install(0x20B + GUS_BASE,write_gus,IO_MB);
+		WriteHandler[9].Install(0x200 + GUS_BASE,write_gus,IO_MB);
+		ReadHandler[9].Install(0x20A + GUS_BASE,read_gus,IO_MB);
+		WriteHandler[10].Install(0x20B + GUS_BASE,write_gus,IO_MB);
 	
 	//	DmaChannels[myGUS.dma1]->Register_TC_Callback(GUS_DMA_TC_Callback);
-	
+
+		GUSLock = SDL_CreateMutex();
+
 		MakeTables();
 	
 		for (Bit8u chan_ct=0; chan_ct<32; chan_ct++) {
@@ -908,6 +1024,8 @@ public:
 
 		memset(&myGUS,0,sizeof(myGUS));
 		memset(GUSRam,0,1024*1024);
+		SDL_DestroyMutex(GUSLock);
+		GUSLock=0;
 	}
 };
 

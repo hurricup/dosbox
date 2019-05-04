@@ -24,6 +24,7 @@
 #include "dosbox.h"
 #include "inout.h"
 #include "mixer.h"
+#include "midi.h"
 #include "dma.h"
 #include "pic.h"
 #include "hardware.h"
@@ -32,8 +33,6 @@
 #include "shell.h"
 using namespace std;
 
-void MIDI_RawOutByte(Bit8u data);
-bool MIDI_Available(void);
 
 #define SB_PIC_EVENTS 0
 
@@ -71,7 +70,6 @@ enum DSP_MODES {
 	MODE_DMA,
 	MODE_DMA_PAUSE,
 	MODE_DMA_MASKED
-
 };
  
 enum DMA_MODES {
@@ -108,6 +106,7 @@ struct SB_INFO {
 	struct {
 		bool pending_8bit;
 		bool pending_16bit;
+		bool pending_mpuirq;
 	} irq;
 	struct {
 		Bit8u state;
@@ -122,6 +121,14 @@ struct SB_INFO {
 		} in,out;
 		Bit8u test_register;
 		Bitu write_busy;
+		Bitu midi_timestamp;
+		bool midiin_sysex;
+		bool midiin_poll;
+		bool midiin_poll_once;
+		bool midiin_irq;
+		bool midiout_raw;
+		bool midiin_timestamp;
+		
 	} dsp;
 	struct {
 		Bit16s data[DSP_DACSIZE+1];
@@ -157,6 +164,8 @@ struct SB_INFO {
 
 
 static SB_INFO sb;
+
+SDL_mutex * SBLock;
 
 static char const * const copyright_string="COPYRIGHT (C) CREATIVE TECHNOLOGY LTD, 1992.";
 
@@ -265,12 +274,26 @@ static INLINE void SB_RaiseIRQ(SB_IRQS type) {
 		break;
 	default:
 		break;
+	case SB_IRQ_MPU:
+		sb.irq.pending_mpuirq=true;
+		break;
 	}
 }
 
 static INLINE void DSP_FlushData(void) {
 	sb.dsp.out.used=0;
 	sb.dsp.out.pos=0;
+	sb.dsp.midiin_sysex=false;
+}
+
+static void SB_MIDIIN_OFF(bool prepare_input) {
+	if (prepare_input) MIDI_ToggleInputDevice(MDEV_SBUART,true);
+	sb.dsp.midiin_poll_once=false;
+	sb.dsp.midiin_poll=false;
+	sb.dsp.midiin_irq=false;
+	sb.dsp.midiin_timestamp=false;
+	sb.dsp.midiout_raw=false;
+	DSP_FlushData();
 }
 
 static double last_dma_callback = 0.0f;
@@ -473,7 +496,7 @@ static void GenerateDMASound(Bitu size) {
 			read=sb.dma.chan->Read(size,&sb.dma.buf.b8[sb.dma.remain_size]);
 			Bitu total=read+sb.dma.remain_size;
             if (!sb.dma.sign)  sb.chan->AddSamples_s8(total>>1,sb.dma.buf.b8);
-            else sb.chan->AddSamples_s8s(total>>1,(Bit8s*)sb.dma.buf.b8); 
+            else sb.chan->AddSamples_s8s(total>>1,(Bit8s*)sb.dma.buf.b8);
 			if (total&1) {
 				sb.dma.remain_size=1;
 				sb.dma.buf.b8[0]=sb.dma.buf.b8[total-1];
@@ -759,6 +782,8 @@ static void DSP_Reset(void) {
 	sb.dsp.cmd_len=0;
 	sb.dsp.in.pos=0;
 	sb.dsp.write_busy=0;
+	SB_MIDIIN_OFF(false);
+	MIDI_ClearBuffer(MOUT_SBUART);
 	PIC_RemoveEvents(DSP_FinishReset);
 
 	sb.dma.left=0;
@@ -831,6 +856,7 @@ Bitu DEBUG_EnableDebugger(void);
 #define DSP_SB2_ABOVE if (sb.type <= SBT_1) { LOG(LOG_SB,LOG_ERROR)("DSP:Command %2X requires SB2 or above",sb.dsp.cmd); break; } 
 
 static void DSP_DoCommand(void) {
+    bool tmpmidi = false;
 //	LOG_MSG("DSP Command %X",sb.dsp.cmd);
 	switch (sb.dsp.cmd) {
 	case 0x04:
@@ -907,9 +933,6 @@ static void DSP_DoCommand(void) {
 	case 0x1c:	/* Auto Init 8-bit DMA */
 		DSP_SB2_ABOVE; /* Note: 0x90 is documented only for DSP ver.2.x and 3.x, not 4.x */
 		DSP_PrepareDMA_Old(DSP_DMA_8,true,false);
-		break;
-	case 0x38:  /* Write to SB MIDI Output */
-		if (sb.midi == true) MIDI_RawOutByte(sb.dsp.in.data[0]);
 		break;
 	case 0x40:	/* Set Timeconstant */
 		DSP_ChangeRate(1000000 / (256 - sb.dsp.in.data[0]));
@@ -1061,12 +1084,43 @@ static void DSP_DoCommand(void) {
 		DSP_FlushData();
 		DSP_AddData(0);
 		break;
-	case 0x30: case 0x31:
-		LOG(LOG_SB,LOG_ERROR)("DSP:Unimplemented MIDI I/O command %2X",sb.dsp.cmd);
+	case 0x30: case 0x32:   /* MIDI In Poll */
+		//LOG(LOG_SB,LOG_NORMAL)("MIDI cmd:%x",sb.dsp.cmd);
+		if (!sb.midi) break;
+		SB_MIDIIN_OFF(true);
+		sb.dsp.midiin_poll_once=true;
+		if (sb.dsp.cmd==0x32) {sb.dsp.midiin_timestamp=true;LOG(LOG_SB,LOG_WARN)("MIDI timestamp mode");}
 		break;
-	case 0x34: case 0x35: case 0x36: case 0x37:
+	case 0x31: case 0x33:  /* MIDI In Irq */
+		//LOG(LOG_SB,LOG_NORMAL)("MIDI cmd:%x",sb.dsp.cmd);
+		if (!sb.midi) break;
+		tmpmidi=sb.dsp.midiin_irq;
+		SB_MIDIIN_OFF(true);
+		if (!tmpmidi) sb.dsp.midiin_irq=true;
+		else sb.dsp.midiin_irq=false;
+		if (sb.dsp.cmd==0x33) sb.dsp.midiin_timestamp=sb.dsp.midiin_irq;
+		if (sb.dsp.midiin_timestamp) LOG(LOG_SB,LOG_WARN)("MIDI timestamp mode");
+		break;
+	case 0x34: case 0x36:/* MIDI In Poll + Out Raw */
+		//LOG(LOG_SB,LOG_NORMAL)("MIDI cmd:%x",sb.dsp.cmd);
 		DSP_SB2_ABOVE;
-		LOG(LOG_SB,LOG_ERROR)("DSP:Unimplemented MIDI UART command %2X",sb.dsp.cmd);
+		if (!sb.midi) break;
+		SB_MIDIIN_OFF(true);
+		sb.dsp.midiin_poll=true;
+		sb.dsp.midiout_raw=true;
+		if (sb.dsp.cmd==0x36) {sb.dsp.midiin_timestamp=true;LOG(LOG_SB,LOG_WARN)("MIDI timestamp mode");}
+		break;
+	case 0x35: case 0x37:  /* MIDI In Irq + Out Raw */
+		//LOG(LOG_SB,LOG_NORMAL)("MIDI cmd:%x",sb.dsp.cmd);
+		DSP_SB2_ABOVE;
+		if (!sb.midi) break;
+		SB_MIDIIN_OFF(true);
+		sb.dsp.midiin_irq=true;
+		sb.dsp.midiout_raw=true;
+		if (sb.dsp.cmd==0x37) {sb.dsp.midiin_timestamp=true;LOG(LOG_SB,LOG_WARN)("MIDI timestamp mode");}
+		break;
+	case 0x38:  /* Write to SB MIDI Output (Raw) */
+		if (sb.midi) MIDI_RawOutByte(sb.dsp.in.data[0],MOUT_SBUART);
 		break;
 	case 0x7f: case 0x1f:
 		DSP_SB2_ABOVE;
@@ -1147,12 +1201,14 @@ static void DSP_DoWrite(Bit8u val) {
 
 static Bit8u DSP_ReadData(void) {
 /* Static so it repeats the last value on succesive reads (JANGLE DEMO) */
+	SDL_mutexP(SBLock);
 	if (sb.dsp.out.used) {
 		sb.dsp.out.lastval=sb.dsp.out.data[sb.dsp.out.pos];
 		sb.dsp.out.pos++;
 		if (sb.dsp.out.pos>=DSP_BUFSIZE) sb.dsp.out.pos-=DSP_BUFSIZE;
 		sb.dsp.out.used--;
 	}
+	SDL_mutexV(SBLock);
 	return sb.dsp.out.lastval;
 }
 
@@ -1452,8 +1508,9 @@ static Bit8u CTMIXER_Read(void) {
 		}
 		return ret;
 	case 0x82:		/* IRQ Status */
-		return	(sb.irq.pending_8bit ? 0x1 : 0) |
-				(sb.irq.pending_16bit ? 0x2 : 0) | 
+		return	(sb.irq.pending_8bit   ? 0x1 : 0) |
+				(sb.irq.pending_16bit  ? 0x2 : 0) |
+				(sb.irq.pending_mpuirq ? 0x4 : 0) |
 				((sb.type == SBT_16) ? 0x20 : 0);
 	default:
 		if (	((sb.type == SBT_PRO1 || sb.type == SBT_PRO2) && sb.mixer.index==0x0c) || /* Input control on SBPro */
@@ -1474,6 +1531,11 @@ static Bitu read_sb(Bitu port,Bitu /*iolen*/) {
 	case MIXER_DATA:
 		return CTMIXER_Read();
 	case DSP_READ_DATA:
+		if (sb.dsp.midiin_poll_once) sb.dsp.midiin_poll_once=false;
+		if (sb.dsp.midiin_irq) {
+				if (sb.dsp.out.used<=1) sb.irq.pending_8bit=false;
+				else DSP_RaiseIRQEvent(0);
+		}
 		return DSP_ReadData();
 	case DSP_READ_STATUS:
 		//TODO See for high speed dma :)
@@ -1513,7 +1575,8 @@ static void write_sb(Bitu port,Bitu val,Bitu /*iolen*/) {
 		DSP_DoReset(val8);
 		break;
 	case DSP_WRITE_DATA:
-		DSP_DoWrite(val8);
+		if (sb.dsp.midiout_raw) MIDI_RawOutByte(val,MOUT_SBUART);
+		else DSP_DoWrite(val);
 		break;
 	case MIXER_INDEX:
 		sb.mixer.index=val8;
@@ -1541,6 +1604,55 @@ bool SB_Get_Address(Bitu& sbaddr, Bitu& sbirq, Bitu& sbdma) {
 		sbirq =sb.hw.irq;
 		sbdma = sb.hw.dma8;
 		return true;
+	}
+}
+
+void SB_UART_InputMsg(Bit8u msg[4]) {
+	if (sb.dsp.midiin_sysex) return;
+	if (SBLock) SDL_mutexP(SBLock);
+	Bit8u len=msg[3];
+	if (sb.dsp.midiin_timestamp) {
+		//TODO: calculate timestamps
+		DSP_AddData(0);DSP_AddData(0);DSP_AddData(0);
+	}
+	if (sb.dsp.midiin_poll_once) {
+		for (Bitu i=0;i<len;i++) DSP_AddData(msg[i]);
+	}
+	if (sb.dsp.midiin_irq) {
+		for (Bitu i=0;i<len;i++) DSP_AddData(msg[i]);
+		if (!sb.irq.pending_8bit) DSP_RaiseIRQEvent(0);
+	}
+	else if (sb.dsp.midiin_poll) {
+		for (Bitu i=0;i<len;i++) DSP_AddData(msg[i]);
+	}
+	if (SBLock) SDL_mutexV(SBLock);
+}
+
+Bits SB_UART_InputSysex(Bit8u *buffer,Bitu len,bool abort) {
+	if (abort) {
+		DSP_FlushData();
+		sb.dsp.midiin_sysex=false;
+		return 0;
+	}
+	sb.dsp.midiin_sysex=true;
+	if (SBLock) SDL_mutexP(SBLock);
+	for (Bitu i=0;i<len;i++) {
+		if (sb.dsp.out.used>=DSP_BUFSIZE) {if (SBLock) SDL_mutexV(SBLock);return (len-i);}
+		DSP_AddData(buffer[i]);
+	}
+	if (SBLock) SDL_mutexV(SBLock);
+	sb.dsp.midiin_sysex=false;
+	return 0;
+}
+
+void SB16_MPU401_IrqToggle(bool status) {
+	if (sb.type!=SBT_16) return;
+	if  (status) {
+		if (!sb.irq.pending_mpuirq) SB_RaiseIRQ(SB_IRQ_MPU);
+	}
+	else if (sb.irq.pending_mpuirq) {
+		sb.irq.pending_mpuirq=false;
+		PIC_DeActivateIRQ(sb.hw.irq);
 	}
 }
 
@@ -1703,6 +1815,8 @@ public:
 		/* Soundblaster midi interface */
 		if (!MIDI_Available()) sb.midi = false;
 		else sb.midi = true;
+
+		SBLock = SDL_CreateMutex();
 	}	
 	
 	~SBLASTER() {
@@ -1722,7 +1836,9 @@ public:
 			break;
 		}
 		if (sb.type==SBT_NONE || sb.type==SBT_GB) return;
-		DSP_Reset(); // Stop everything	
+		DSP_Reset(); //Stop everything
+		SDL_DestroyMutex(SBLock);
+		SBLock=0;
 	}	
 }; //End of SBLASTER class
 
